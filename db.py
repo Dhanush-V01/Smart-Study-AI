@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,8 @@ import cloud_sync
 _CUSTOM_DB_PATH = cloud_sync._get_secret("SMARTSTUDY_DB_PATH")
 DB_PATH = Path(_CUSTOM_DB_PATH) if _CUSTOM_DB_PATH else (Path(__file__).resolve().parent / "smartstudy.db")
 _AUTO_SYNC_SUSPEND = False
+_INIT_LOCK = threading.Lock()
+_INITIALIZED_PATHS: set[str] = set()
 SUBJECTS = ["Maths", "Physics", "DSA", "DBMS", "English"]
 SKILL_CATEGORIES = [
     "Technical",
@@ -70,9 +73,9 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 @contextmanager
 def get_connection():
-    """Yield a SQLite connection with foreign keys and auto-sync after real writes."""
+    """Yield a SQLite connection with foreign keys, lock timeout, and auto-sync after real writes."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     before_changes = conn.total_changes
@@ -99,14 +102,21 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_def: str)
 
 
 def init_db() -> None:
-    """Pull cloud DB if configured on cold start, then create/migrate tables & seed defaults."""
+    """Thread-safe idempotent DB initialization: pull cloud DB on cold start, migrate, and seed once."""
     global _AUTO_SYNC_SUSPEND
-    cloud_sync.pull_db_on_startup(DB_PATH)
-    _AUTO_SYNC_SUSPEND = True
-    try:
-        _init_db_inner()
-    finally:
-        _AUTO_SYNC_SUSPEND = False
+    db_key = str(DB_PATH.resolve())
+    if db_key in _INITIALIZED_PATHS and DB_PATH.exists():
+        return
+    with _INIT_LOCK:
+        if db_key in _INITIALIZED_PATHS and DB_PATH.exists():
+            return
+        cloud_sync.pull_db_on_startup(DB_PATH)
+        _AUTO_SYNC_SUSPEND = True
+        try:
+            _init_db_inner()
+            _INITIALIZED_PATHS.add(db_key)
+        finally:
+            _AUTO_SYNC_SUSPEND = False
 
 
 def _init_db_inner() -> None:
@@ -601,7 +611,8 @@ def _init_db_inner() -> None:
             _clear_all_tables(conn)
 
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if user_count == 0:
+        student_count = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+        if user_count == 0 and student_count == 0:
             _seed_demo_data(conn)
         _ensure_upgrade_seed_data(conn)
 
@@ -885,7 +896,7 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
     ]
     conn.executemany(
         """
-        INSERT INTO students
+        INSERT OR IGNORE INTO students
         (usn, name, email, course, branch, semester, section, academic_year, grade, avatar_emoji)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -907,7 +918,7 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
     ]
     conn.executemany(
         """
-        INSERT INTO users (username, password_hash, role, full_name, department, linked_student_id, created_at)
+        INSERT OR IGNORE INTO users (username, password_hash, role, full_name, department, linked_student_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         users_data,
